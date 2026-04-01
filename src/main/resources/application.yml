@@ -1,0 +1,23 @@
+server:
+  port: 8081
+spring:
+  datasource:
+    # URL for the JDBC driver, specifying the host, port (default 3306), and database name
+    url: jdbc:mysql://localhost:3306/bookingdb?serverTimezone=UTC
+    username: root # e.g., root
+    password:
+    driver-class-name: com.mysql.cj.jdbc.Driver # The correct MySQL driver class
+  jpa:
+    # JPA (Hibernate) specific configurations
+    hibernate:
+      ddl-auto: update # Options: none, update, create, create-drop
+    show-sql: true # Log SQL queries to the console
+    properties:
+      hibernate:
+        dialect: org.hibernate.dialect.MySQLDialect
+
+  client:
+    register-with-eureka: true
+    fetch-registry: true
+    service-url:
+      defaultZone: http://localhost:8761/eureka/
