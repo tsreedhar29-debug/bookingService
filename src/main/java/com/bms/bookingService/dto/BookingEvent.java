@@ -13,19 +13,17 @@ import java.util.List;
 @Builder
 @NoArgsConstructor
 @AllArgsConstructor
-public class BookingResponse {
+public class BookingEvent {
+    private String eventId;
     private String bookingId;
     private String userId;
     private String showId;
     private String theatreId;
-    private String movieName;
-    private String theatreName;
-    private LocalDateTime showTime;
-    private List<String> seatNumbers;
-    private BigDecimal baseAmount;
+    private List<String> seatIds;
+    private BigDecimal amount;
     private BigDecimal discount;
     private BigDecimal finalAmount;
-    private String status;
-    private String bookingReference;
-    private LocalDateTime bookingTime;
+    private BookingEventType eventType;
+    private LocalDateTime timestamp;
+    private String sagaId;
 }

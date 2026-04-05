@@ -3,131 +3,105 @@ package com.bms.bookingService.service;
 import com.bms.bookingService.dto.*;
 import com.bms.bookingService.entity.Booking;
 import com.bms.bookingService.entity.BookingStatus;
-import com.bms.bookingService.feignClients.PaymentClient;
-import com.bms.bookingService.feignClients.SeatClient;
+import com.bms.bookingService.exception.BusinessException;
 import com.bms.bookingService.repository.BookingRepository;
-import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.kafka.core.KafkaTemplate;
+import com.bms.bookingService.saga.BookingSagaOrchestrator;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
 
+import java.math.BigDecimal;
 import java.time.LocalDateTime;
 import java.util.List;
-import java.util.UUID;
+import java.util.stream.Collectors;
 
 @Service
+@RequiredArgsConstructor
+@Slf4j
 public class BookingServiceImpl implements BookingService{
 
-    @Autowired
-    private SeatClient seatClient;
-    @Autowired
-    private PaymentClient paymentClient;
-    @Autowired
-    private BookingRepository repo;
- /*   @Autowired
-    private KafkaTemplate<String, Object> kafka;
-*/
- @Override
- public BookingResponse createBooking(BookingRequest req) {
 
-     Booking booking = new Booking();
-     booking.setId(UUID.randomUUID().toString());
-     booking.setUserId(req.getUser().getUserId());
-     booking.setShowId(req.getShow().getShowId());
-     booking.setStatus(BookingStatus.INITIATED);
-     booking.setCreatedAt(LocalDateTime.now());
-        repo.save(booking);
+    private final BookingRepository bookingRepository;
+    private final BookingSagaOrchestrator sagaOrchestrator;
+    private final DiscountService discountService;
 
-     SeatLockResponse locked = seatClient.lockSeats(new SeatLockRequest(req.getShow().getShowId(),
-             req.getSeats().stream().map(SeatDTO::getNumber).toList()));
+    @Transactional
+    public BookingResponse createBooking(BookingRequest request) {
+        log.info("Creating booking for user: {}, show: {}", request.getUserId(), request.getShowId());
 
-     if (!locked.isSuccess()) {
-         booking.setStatus(BookingStatus.FAILED);
-         repo.save(booking);
-         throw new RuntimeException("Seats not available");
-     }
+        validateBookingRequest(request);
 
-     booking.setStatus(BookingStatus.SEATS_LOCKED);
-     repo.save(booking);
+        BigDecimal baseAmount = calculateBaseAmount(request.getSeatNumbers().size());
+        LocalDateTime showTime = LocalDateTime.now().plusDays(1);
 
-     // STEP 2: Calculate amount
-     double amount = calculateAmount(req);
+        BigDecimal discount = discountService.calculateDiscount(
+                baseAmount, request.getSeatNumbers().size(), showTime);
+        BigDecimal finalAmount = baseAmount.subtract(discount);
 
-     // STEP 3: Payment
-     boolean paid = paymentClient.pay(
-             new PaymentRequest(booking.getId(), amount)
-     );
+        String seatIds = String.join(",", request.getSeatNumbers());
 
-     if (!paid) {
-         seatClient.releaseSeats(
-                 new SeatLockRequest(req.getShow().getShowId(),req.getSeats().stream().map(SeatDTO::getNumber).toList())
-         );
-         booking.setStatus(BookingStatus.PAYMENT_FAILED);
-         repo.save(booking);
-         throw new RuntimeException("Payment failed");
-     }
+        Booking booking = Booking.builder()
+                .userId(request.getUserId())
+                .showId(request.getShowId())
+                .theatreId(request.getTheatreId())
+                .movieId(request.getMovieId())
+                .seatIds(seatIds)
+                .baseAmount(baseAmount)
+                .discount(discount)
+                .finalAmount(finalAmount)
+                .status(BookingStatus.INITIATED)
+                .build();
 
-     // SUCCESS
-     booking.setStatus(BookingStatus.CONFIRMED);
-     booking.setTotalAmount(amount);
-     repo.save(booking);
+        booking = bookingRepository.save(booking);
 
-     // Publish event
- //    kafka.send("booking.created", booking);
+        sagaOrchestrator.startBookingSaga(booking);
 
-     return mapToResponse(booking, req);
-    }
-    private double calculateAmount(BookingRequest req) {
-
-        double total = req.getSeats().stream()
-                .mapToDouble(SeatDTO::getPrice)
-                .sum();
-
-        // 50% on 3rd ticket
-        if (req.getSeats().size() >= 3) {
-            total -= req.getSeats().get(2).getPrice() * 0.5;
-        }
-
-        // Afternoon discount
-        if (req.getShow().getShowTime().compareTo("12:00") >= 0 &&
-                req.getShow().getShowTime().compareTo("16:00") <= 0) {
-            total *= 0.8;
-        }
-
-        return total;
+        return toResponse(booking);
     }
 
-    private BookingResponse mapToResponse(Booking booking, BookingRequest req) {
+    public BookingResponse getBooking(String bookingId) {
+        Booking booking = bookingRepository.findById(bookingId)
+                .orElseThrow(() -> new BusinessException("BOOKING_NOT_FOUND",
+                        "Booking not found with id: " + bookingId));
+        return toResponse(booking);
+    }
 
-        BookingResponse response = new BookingResponse();
-
-        // Booking details
-        response.setBookingId(booking.getId());
-        response.setStatus(booking.getStatus().name());
-        response.setTotalAmount(booking.getTotalAmount());
-
-        // Seat details
-        List<String> seatIds = req.getSeats()
+    public List<BookingResponse> getUserBookings(String userId) {
+        return bookingRepository.findByUserId(userId)
                 .stream()
-                .map(SeatDTO::getSeatId)
-                .toList();
-        response.setSeats(seatIds);
+                .map(this::toResponse)
+                .collect(Collectors.toList());
+    }
 
-        // Show details
-        if (req.getShow() != null) {
-            response.setTheatreName(req.getShow().getTheatreName());
-            response.setMovieName(req.getShow().getMovieName());
-            response.setShowTime(req.getShow().getShowTime());
+    private void validateBookingRequest(BookingRequest request) {
+        if (request.getSeatNumbers() == null || request.getSeatNumbers().isEmpty()) {
+            throw new BusinessException("INVALID_REQUEST", "Seat numbers are required");
         }
-
-        // Message handling
-        switch (booking.getStatus()) {
-            case CONFIRMED -> response.setMessage("Booking confirmed successfully");
-            case PAYMENT_FAILED -> response.setMessage("Payment failed. Seats released.");
-            case FAILED -> response.setMessage("Booking failed. Please try again.");
-            case SEATS_LOCKED -> response.setMessage("Seats locked. Awaiting payment.");
-            default -> response.setMessage("Booking initiated");
+        if (request.getSeatNumbers().size() > 10) {
+            throw new BusinessException("INVALID_REQUEST",
+                    "Maximum 10 seats can be booked at once");
         }
+    }
 
-        return response;
+    private BigDecimal calculateBaseAmount(int numberOfSeats) {
+        BigDecimal pricePerSeat = new BigDecimal("250.00");
+        return pricePerSeat.multiply(new BigDecimal(numberOfSeats));
+    }
+
+    private BookingResponse toResponse(Booking booking) {
+        return BookingResponse.builder()
+                .bookingId(booking.getId())
+                .userId(booking.getUserId())
+                .showId(booking.getShowId())
+                .theatreId(booking.getTheatreId())
+                .seatNumbers(List.of(booking.getSeatIds().split(",")))
+                .baseAmount(booking.getBaseAmount())
+                .discount(booking.getDiscount())
+                .finalAmount(booking.getFinalAmount())
+                .status(booking.getStatus().name())
+                .bookingReference(booking.getBookingReference())
+                .bookingTime(booking.getCreatedAt())
+                .build();
     }
 }
